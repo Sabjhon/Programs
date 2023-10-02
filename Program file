@@ -1,0 +1,180 @@
+import sys
+import struct
+import serial
+import time
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtWidgets import QRadioButton, QHBoxLayout
+import pyqtgraph as pg
+
+class Ui_MainWindow(object):
+    def setupUi(self, MainWindow):
+        MainWindow.setObjectName("MainWindow")
+        MainWindow.resize(800, 600)
+        self.centralwidget = QtWidgets.QWidget(MainWindow)
+        self.centralwidget.setObjectName("centralwidget")
+        self.verticalLayout = QtWidgets.QVBoxLayout(self.centralwidget)
+        self.verticalLayout.setObjectName("verticalLayout")
+        self.pushButton = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton.setObjectName("pushButton")
+        self.verticalLayout.addWidget(self.pushButton)
+
+        self.radio_actual = QRadioButton("Actual", MainWindow)
+        self.radio_actual.setChecked(True)
+        self.radio_plus_10 = QRadioButton("Float + 10", MainWindow)
+        self.radio_minus_10 = QRadioButton("Float - 10", MainWindow)
+
+        self.radio_layout = QHBoxLayout()
+        self.radio_layout.addWidget(self.radio_actual)
+        self.radio_layout.addWidget(self.radio_plus_10)
+        self.radio_layout.addWidget(self.radio_minus_10)
+        self.verticalLayout.addLayout(self.radio_layout)
+
+        MainWindow.setCentralWidget(self.centralwidget)
+        self.retranslateUi(MainWindow)
+        QtCore.QMetaObject.connectSlotsByName(MainWindow)
+
+    def retranslateUi(self, MainWindow):
+        _translate = QtCore.QCoreApplication.translate
+        MainWindow.setWindowTitle(_translate("MainWindow", "Arduino Data Plot"))
+        self.pushButton.setText(_translate("MainWindow", "Start"))
+
+class WorkerSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal()
+    progress = QtCore.pyqtSignal(float, float, float)
+    error = QtCore.pyqtSignal(tuple)
+
+class Worker(QtCore.QObject):
+    signals = WorkerSignals()
+    def __init__(self):
+        super().__init__()
+        self.is_running = False
+        self.connected = False
+        self.serial_port = None
+
+    def start(self):
+        self.is_running = True
+        try:
+            self.serial_port = serial.Serial('COM9', 9600, timeout=1, write_timeout=1, inter_byte_timeout=None, rtscts=True, dsrdtr=True)
+        except serial.SerialException as e:
+            print(f"Error opening serial port: {e}")
+            self.is_running = False
+            return
+
+    def stop(self):
+        self.is_running = False
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
+
+    def run(self):
+        self.start()
+        while self.is_running:
+            if (self.serial_port.read() == b'\xff') and (self.serial_port.read() == b'\xff'):
+                self.connected = True
+                chksum = 255 + 255
+                pl_Sz = self.serial_port.read()[0]
+                chksum += pl_Sz
+                payload = self.serial_port.read(pl_Sz - 1)
+                chksum += sum(payload)
+                chksum = bytes([chksum % 256])
+                _chksum = self.serial_port.read()
+                
+                if _chksum == chksum:
+                    data_actual, float_plus_10, float_minus_10 = struct.unpack('3f', payload[:12])
+                    print(f"Actual Value: {data_actual}")
+                    print(f"Float + 10: {float_plus_10}")
+                    print(f"Float - 10: {float_minus_10}")
+                    self.signals.progress.emit(data_actual, float_plus_10, float_minus_10)
+                else:
+                    print(f"Checksum mismatch. Expected: {chksum}, Received: {_chksum},")
+
+        self.signals.finished.emit()
+
+class MplCanvas(pg.GraphicsLayoutWidget):
+    def __init__(self, parent=None, title=""):
+        super().__init__(parent)
+        self.plot = self.addPlot(title=title)
+        self.plot.showGrid(x=True, y=True)
+        self.curve = self.plot.plot(pen='r')
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+        self.ui.pushButton.clicked.connect(self.toggle_serial_thread)
+        self.displaying_actual = True
+
+        self.worker = Worker()
+        self.worker.signals.progress.connect(self.update_plot)
+        self.worker.signals.finished.connect(self.worker_finished)
+
+        self.worker_thread = QtCore.QThread()
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+
+        self.canvas_actual = MplCanvas(parent=self, title="Actual")
+        self.canvas_plus_10 = MplCanvas(parent=self, title="Float + 10")
+        self.canvas_minus_10 = MplCanvas(parent=self, title="Float - 10")
+
+        self.ui.verticalLayout.addWidget(self.canvas_actual)
+        self.ui.verticalLayout.addWidget(self.canvas_plus_10)
+        self.ui.verticalLayout.addWidget(self.canvas_minus_10)
+
+        self.ui.radio_actual.clicked.connect(self.display_actual)
+        self.ui.radio_plus_10.clicked.connect(self.display_plus_10)
+        self.ui.radio_minus_10.clicked.connect(self.display_minus_10)
+
+        # Initialize data lists
+        self.actual_data_list = []
+        self.float_plus_10_list = []
+        self.float_minus_10_list = []
+
+    def toggle_serial_thread(self):
+        if not self.worker_thread.isRunning():
+            self.worker_thread.start()
+            self.ui.pushButton.setText("Stop")
+        else:
+            self.worker.stop()
+            self.worker_thread.quit()
+            self.worker_thread.wait()
+            self.ui.pushButton.setText("Start")
+
+    def display_actual(self):
+        self.displaying_actual = True
+
+    def display_plus_10(self):
+        self.displaying_actual = False
+    
+    def display_minus_10(self):
+        self.displaying_actual = False
+
+    def update_plot(self, actual_value, float_plus_10, float_minus_10):
+        current_time = time.time()
+
+        if self.displaying_actual:
+            self.canvas_actual.curve.setData([current_time], [actual_value])
+            self.canvas_plus_10.curve.setData([current_time], [float_plus_10])
+            self.canvas_minus_10.curve.setData([current_time], [float_minus_10])
+        else:
+            self.canvas_actual.curve.setData([current_time], [actual_value])
+            self.canvas_plus_10.curve.setData([current_time], [float_plus_10])
+            self.canvas_minus_10.curve.setData([current_time], [float_minus_10])
+
+        # Append data to lists
+        self.actual_data_list.append(actual_value)
+        self.float_plus_10_list.append(float_plus_10)
+        self.float_minus_10_list.append(float_minus_10)
+
+        # Print the lists
+        print("Actual Data List:", self.actual_data_list)
+        print("Float + 10 List:", self.float_plus_10_list)
+        print("Float - 10 List:", self.float_minus_10_list)
+
+    def worker_finished(self):
+        self.ui.pushButton.setText("Start")
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
